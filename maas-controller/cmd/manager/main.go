@@ -1414,6 +1414,7 @@ func main() {
 	// cleanup finalizer if present. controllerNamespace is where maas-controller is deployed.
 	if err := (&maas.LifecycleReconciler{
 		Client:                      mgr.GetClient(),
+		APIReader:                   mgr.GetAPIReader(),
 		Scheme:                      mgr.GetScheme(),
 		DeploymentName:              "maas-controller",
 		DeploymentNS:                controllerNamespace,
