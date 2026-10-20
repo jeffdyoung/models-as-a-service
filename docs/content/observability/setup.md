@@ -134,6 +134,14 @@ appears in the local write.
 exporter appends that itself. Note the tenant in the path is the receiver's, and need not match
 the `application` tenant used locally.
 
+!!! note "Querying the receiver"
+    The receiver's tenant and the record's `log_type` are independent. Usage records always
+    carry `log_type="application"`, set by the collector, even when written to an
+    `infrastructure` tenant. So a record sent to
+    `/api/logs/v1/infrastructure/otlp` is read back with
+    `GET /api/logs/v1/infrastructure/…?query={log_type="application"}`. Selecting
+    `{log_type="infrastructure"}` matches nothing and looks like delivery failure.
+
 **`headersSecret`** must exist in the monitoring namespace. **Every key becomes an HTTP header**,
 so a bearer token is supplied as a key named `Authorization` whose value is `Bearer <token>`.
 Values are projected into the collector as environment variables and referenced indirectly, so

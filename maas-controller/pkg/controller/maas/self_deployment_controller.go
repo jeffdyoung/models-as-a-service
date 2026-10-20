@@ -708,14 +708,23 @@ func (r *LifecycleReconciler) ensureUsageLogs(ctx context.Context, log logr.Logg
 				log.Error(statusErr, "update Config status after configuring remote export")
 			}
 		}
-	} else if apimeta.FindStatusCondition(cfg.Status.Conditions,
-		maasv1alpha1.ConfigConditionRemoteUsageLogsConfigured) != nil {
+	} else {
 		// Clean removal: unsetting remoteOtlp drops the condition along with the
-		// exporter and pipeline, which simply stop being rendered.
-		apimeta.RemoveStatusCondition(&cfg.Status.Conditions,
-			maasv1alpha1.ConfigConditionRemoteUsageLogsConfigured)
-		if statusErr := r.Status().Update(ctx, &cfg); statusErr != nil {
-			log.Error(statusErr, "update Config status after removing remote export")
+		// exporter and pipeline, which simply stop being rendered. The trusted-CA
+		// ConfigMap is not rendered from the bundle, so nothing stops reconciling
+		// it — it has to be deleted explicitly. It is owned by the Config and so
+		// would be collected eventually, but leaving a ~220KB ConfigMap that the
+		// network operator keeps refreshing is not a clean removal.
+		if caErr := r.removeRemoteOtlpTrustedCA(ctx); caErr != nil {
+			log.Error(caErr, "remove trusted CA bundle after disabling remote usage-log export")
+		}
+		if apimeta.FindStatusCondition(cfg.Status.Conditions,
+			maasv1alpha1.ConfigConditionRemoteUsageLogsConfigured) != nil {
+			apimeta.RemoveStatusCondition(&cfg.Status.Conditions,
+				maasv1alpha1.ConfigConditionRemoteUsageLogsConfigured)
+			if statusErr := r.Status().Update(ctx, &cfg); statusErr != nil {
+				log.Error(statusErr, "update Config status after removing remote export")
+			}
 		}
 	}
 
@@ -1118,6 +1127,19 @@ func (r *LifecycleReconciler) ensureRemoteOtlpTrustedCA(ctx context.Context, cfg
 	if err := r.Apply(ctx, client.ApplyConfigurationFromUnstructured(cm),
 		client.ForceOwnership, client.FieldOwner("maas-controller")); err != nil {
 		return fmt.Errorf("apply %s: %w", remoteOtlpTrustedCAConfigMap, err)
+	}
+	return nil
+}
+
+// removeRemoteOtlpTrustedCA deletes the injected trusted-CA ConfigMap. Safe to
+// call when it does not exist, which is the common case.
+func (r *LifecycleReconciler) removeRemoteOtlpTrustedCA(ctx context.Context) error {
+	cm := &unstructured.Unstructured{}
+	cm.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"})
+	cm.SetName(remoteOtlpTrustedCAConfigMap)
+	cm.SetNamespace(r.MonitoringNamespace)
+	if err := r.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete %s: %w", remoteOtlpTrustedCAConfigMap, err)
 	}
 	return nil
 }
