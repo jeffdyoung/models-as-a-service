@@ -3,6 +3,7 @@ package maas
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
@@ -1898,4 +1899,296 @@ func TestFormatTenantList(t *testing.T) {
 	g.Expect(formatTenantList([]string{"ns/a", "ns/b", "ns/c"}, 5)).To(Equal("ns/a, ns/b, ns/c"))
 	g.Expect(formatTenantList([]string{"ns/a", "ns/b", "ns/c"}, 2)).To(Equal("ns/a, ns/b (and 1 more)"))
 	g.Expect(formatTenantList([]string{"a", "b", "c", "d", "e", "f"}, 3)).To(Equal("a, b, c (and 3 more)"))
+}
+
+// usageLogsCollectorFixture returns a collector shaped like the one the
+// usage-logs kustomize bundle renders: one local exporter, one logs pipeline.
+func usageLogsCollectorFixture() *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "opentelemetry.io/v1beta1",
+			"kind":       "OpenTelemetryCollector",
+			"metadata": map[string]any{
+				"name":      usageLogsCollectorName,
+				"namespace": "redhat-ods-monitoring",
+			},
+			"spec": map[string]any{
+				"env": []any{
+					map[string]any{"name": "NAMESPACE", "value": "redhat-ods-monitoring"},
+				},
+				"volumes":      []any{map[string]any{"name": "service-ca"}},
+				"volumeMounts": []any{map[string]any{"name": "service-ca"}},
+				"config": map[string]any{
+					"processors": map[string]any{
+						"batch":          map[string]any{},
+						"memory_limiter": map[string]any{},
+						"resource":       map[string]any{},
+					},
+					"exporters": map[string]any{
+						"otlp_http/loki": map[string]any{
+							"endpoint": "https://usage-gateway-http.${env:NAMESPACE}.svc:8080/api/logs/v1/application/otlp",
+						},
+					},
+					"service": map[string]any{
+						"pipelines": map[string]any{
+							"logs": map[string]any{
+								"receivers":  []any{"otlp"},
+								"processors": []any{"memory_limiter", "resource", "batch"},
+								"exporters":  []any{"otlp_http/loki"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestPatchRemoteOtlpExporter(t *testing.T) {
+	remote := func() *maasv1alpha1.RemoteOtlpConfig {
+		return &maasv1alpha1.RemoteOtlpConfig{ //nolint:gosec // G101: Secret name, not a credential.
+			Endpoint:      "https://hub.example.com/api/logs/v1/infrastructure/otlp",
+			HeadersSecret: "hub-usage-logs-auth",
+		}
+	}
+
+	t.Run("adds a second exporter and pipeline, leaving the local write untouched", func(t *testing.T) {
+		g := NewWithT(t)
+		collector := usageLogsCollectorFixture()
+
+		err := patchRemoteOtlpExporter(collector, remote(), []string{"Authorization"}, "cid", "cname")
+		g.Expect(err).NotTo(HaveOccurred())
+
+		exporters, _, err := unstructured.NestedMap(collector.Object, "spec", "config", "exporters")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(exporters).To(HaveKey("otlp_http/loki"))
+		g.Expect(exporters).To(HaveKey(remoteOtlpExporterKey))
+
+		// The local exporter must be byte-identical: dual-write, not redirect.
+		local, ok := exporters["otlp_http/loki"].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		g.Expect(local["endpoint"]).To(Equal(
+			"https://usage-gateway-http.${env:NAMESPACE}.svc:8080/api/logs/v1/application/otlp"))
+		g.Expect(local).NotTo(HaveKey("headers"))
+
+		pipelines, _, err := unstructured.NestedMap(collector.Object, "spec", "config", "service", "pipelines")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(pipelines).To(HaveKey("logs"))
+		g.Expect(pipelines).To(HaveKey(remoteOtlpPipelineKey))
+
+		// Cluster identity must not leak into the local pipeline.
+		localPipeline, ok := pipelines["logs"].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		g.Expect(localPipeline["processors"]).NotTo(ContainElement(remoteOtlpResourceProcessorKey))
+		g.Expect(localPipeline["exporters"]).To(Equal([]any{"otlp_http/loki"}))
+
+		remotePipeline, ok := pipelines[remoteOtlpPipelineKey].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		g.Expect(remotePipeline["processors"]).To(ContainElement(remoteOtlpResourceProcessorKey))
+		// The shared `resource` processor must also run, or remote records lose
+		// log_type and become unfindable by the documented hub query.
+		g.Expect(remotePipeline["processors"]).To(ContainElement("resource"))
+		g.Expect(remotePipeline["exporters"]).To(Equal([]any{remoteOtlpExporterKey}))
+	})
+
+	t.Run("projects header values as env vars rather than inlining them", func(t *testing.T) {
+		g := NewWithT(t)
+		collector := usageLogsCollectorFixture()
+
+		err := patchRemoteOtlpExporter(collector, remote(),
+			[]string{"Authorization", "X-Scope-OrgID"}, "cid", "cname")
+		g.Expect(err).NotTo(HaveOccurred())
+
+		exporters, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "exporters")
+		exporter, ok := exporters[remoteOtlpExporterKey].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		headers, ok := exporter["headers"].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		g.Expect(headers["Authorization"]).To(Equal("${env:REMOTE_OTLP_HDR_AUTHORIZATION}"))
+		g.Expect(headers["X-Scope-OrgID"]).To(Equal("${env:REMOTE_OTLP_HDR_X_SCOPE_ORGID}"))
+
+		env, _, err := unstructured.NestedSlice(collector.Object, "spec", "env")
+		g.Expect(err).NotTo(HaveOccurred())
+		names := []string{}
+		for _, e := range env {
+			em, ok := e.(map[string]any)
+			g.Expect(ok).To(BeTrue())
+			name, ok := em["name"].(string)
+			g.Expect(ok).To(BeTrue())
+			names = append(names, name)
+		}
+		g.Expect(names).To(ContainElements(
+			"NAMESPACE", "REMOTE_OTLP_HDR_AUTHORIZATION", "REMOTE_OTLP_HDR_X_SCOPE_ORGID"))
+
+		// No secret material anywhere in the rendered object.
+		g.Expect(fmt.Sprintf("%v", collector.Object)).NotTo(ContainSubstring("Bearer "))
+	})
+
+	t.Run("stamps resolved cluster identity on the remote pipeline only", func(t *testing.T) {
+		g := NewWithT(t)
+		collector := usageLogsCollectorFixture()
+
+		err := patchRemoteOtlpExporter(collector, remote(), []string{"Authorization"},
+			"374d8722-81a3-4a60-ae7d-6e92c025aab8", "spoke-1")
+		g.Expect(err).NotTo(HaveOccurred())
+
+		processors, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "processors")
+		proc, ok := processors[remoteOtlpResourceProcessorKey].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		attrs, ok := proc["attributes"].([]any)
+		g.Expect(ok).To(BeTrue())
+		g.Expect(attrs).To(HaveLen(2))
+
+		got := map[string]any{}
+		for _, a := range attrs {
+			am, ok := a.(map[string]any)
+			g.Expect(ok).To(BeTrue())
+			key, ok := am["key"].(string)
+			g.Expect(ok).To(BeTrue())
+			got[key] = am["value"]
+			g.Expect(am["action"]).To(Equal("upsert"))
+		}
+		g.Expect(got["cluster_id"]).To(Equal("374d8722-81a3-4a60-ae7d-6e92c025aab8"))
+		g.Expect(got["cluster_name"]).To(Equal("spoke-1"))
+
+		// The shared local "resource" processor is untouched.
+		g.Expect(processors["resource"]).To(Equal(map[string]any{}))
+	})
+
+	t.Run("always mounts a CA bundle; source depends on caBundleSecret", func(t *testing.T) {
+		g := NewWithT(t)
+
+		// The collector mounts the service CA over the system trust path, so it
+		// cannot verify a publicly trusted endpoint unless given a bundle. With no
+		// caBundleSecret we fall back to the cluster's injected trusted bundle.
+		deflt := usageLogsCollectorFixture()
+		g.Expect(patchRemoteOtlpExporter(deflt, remote(), []string{"Authorization"}, "c", "n")).To(Succeed())
+		exporters, _, _ := unstructured.NestedMap(deflt.Object, "spec", "config", "exporters")
+		dExp, ok := exporters[remoteOtlpExporterKey].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		dTLS, ok := dExp["tls"].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		g.Expect(dTLS["ca_file"]).To(Equal(remoteOtlpCAMountPath + "/" + remoteOtlpCAKey))
+
+		volumes, _, _ := unstructured.NestedSlice(deflt.Object, "spec", "volumes")
+		g.Expect(volumes).To(HaveLen(2))
+		added, ok := volumes[1].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		cm, ok := added["configMap"].(map[string]any)
+		g.Expect(ok).To(BeTrue(), "default source should be the injected trusted-CA ConfigMap")
+		g.Expect(cm["name"]).To(Equal(remoteOtlpTrustedCAConfigMap))
+
+		// An explicit caBundleSecret takes over the same mount.
+		withTLS := usageLogsCollectorFixture()
+		r := remote()
+		r.TLS = &maasv1alpha1.RemoteOtlpTLSConfig{CABundleSecret: "hub-ca"}
+		g.Expect(patchRemoteOtlpExporter(withTLS, r, []string{"Authorization"}, "c", "n")).To(Succeed())
+
+		volumes, _, _ = unstructured.NestedSlice(withTLS.Object, "spec", "volumes")
+		g.Expect(volumes).To(HaveLen(2))
+		added, ok = volumes[1].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		sec, ok := added["secret"].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		g.Expect(sec["secretName"]).To(Equal("hub-ca"))
+		mounts, _, _ := unstructured.NestedSlice(withTLS.Object, "spec", "volumeMounts")
+		g.Expect(mounts).To(HaveLen(2))
+	})
+
+	t.Run("ignores resources that are not the usage-logs collector", func(t *testing.T) {
+		g := NewWithT(t)
+
+		other := usageLogsCollectorFixture()
+		other.SetName("data-science-collector")
+		before := fmt.Sprintf("%v", other.Object)
+		g.Expect(patchRemoteOtlpExporter(other, remote(), []string{"Authorization"}, "c", "n")).To(Succeed())
+		g.Expect(fmt.Sprintf("%v", other.Object)).To(Equal(before))
+
+		deployment := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "apps/v1", "kind": "Deployment",
+			"metadata": map[string]any{"name": usageLogsCollectorName},
+		}}
+		before = fmt.Sprintf("%v", deployment.Object)
+		g.Expect(patchRemoteOtlpExporter(deployment, remote(), []string{"Authorization"}, "c", "n")).To(Succeed())
+		g.Expect(fmt.Sprintf("%v", deployment.Object)).To(Equal(before))
+	})
+}
+
+func TestRemoteOtlpEnvVarName(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(remoteOtlpEnvVarName("Authorization")).To(Equal("REMOTE_OTLP_HDR_AUTHORIZATION"))
+	g.Expect(remoteOtlpEnvVarName("X-Scope-OrgID")).To(Equal("REMOTE_OTLP_HDR_X_SCOPE_ORGID"))
+	g.Expect(remoteOtlpEnvVarName("x.weird/key")).To(Equal("REMOTE_OTLP_HDR_X_WEIRD_KEY"))
+}
+
+func TestPatchRemoteOtlpEgress(t *testing.T) {
+	policy := func() *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "networking.k8s.io/v1",
+			"kind":       "NetworkPolicy",
+			"metadata":   map[string]any{"name": usageLogsCollectorEgressPolicyName},
+			"spec": map[string]any{
+				"policyTypes": []any{"Egress"},
+				"egress": []any{
+					map[string]any{"ports": []any{map[string]any{"protocol": "TCP", "port": int64(8080)}}},
+				},
+			},
+		}}
+	}
+
+	t.Run("appends a rule for the remote endpoint port", func(t *testing.T) {
+		g := NewWithT(t)
+		p := policy()
+		r := &maasv1alpha1.RemoteOtlpConfig{Endpoint: "https://hub.example.com/api/logs/v1/infrastructure/otlp"}
+		g.Expect(patchRemoteOtlpEgress(p, r)).To(Succeed())
+
+		egress, _, err := unstructured.NestedSlice(p.Object, "spec", "egress")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(egress).To(HaveLen(2)) // original local rule preserved
+
+		added, ok := egress[1].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		ports, ok := added["ports"].([]any)
+		g.Expect(ok).To(BeTrue())
+		pm, ok := ports[0].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		g.Expect(pm["port"]).To(Equal(int64(443)))
+
+		to, ok := added["to"].([]any)
+		g.Expect(ok).To(BeTrue())
+		tm, ok := to[0].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		ipb, ok := tm["ipBlock"].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		g.Expect(ipb["cidr"]).To(Equal("0.0.0.0/0"))
+		g.Expect(ipb["except"]).To(ContainElement("169.254.0.0/16"))
+	})
+
+	t.Run("honours an explicit port and plain http", func(t *testing.T) {
+		g := NewWithT(t)
+		for endpoint, want := range map[string]int64{
+			"https://hub.example.com:8443/otlp": 8443,
+			"http://hub.example.com/otlp":       80,
+		} {
+			p := policy()
+			g.Expect(patchRemoteOtlpEgress(p, &maasv1alpha1.RemoteOtlpConfig{Endpoint: endpoint})).To(Succeed())
+			egress, _, _ := unstructured.NestedSlice(p.Object, "spec", "egress")
+			added, ok := egress[1].(map[string]any)
+			g.Expect(ok).To(BeTrue())
+			ports, ok := added["ports"].([]any)
+			g.Expect(ok).To(BeTrue())
+			pm, ok := ports[0].(map[string]any)
+			g.Expect(ok).To(BeTrue())
+			g.Expect(pm["port"]).To(Equal(want), "endpoint %s", endpoint)
+		}
+	})
+
+	t.Run("ignores other NetworkPolicies", func(t *testing.T) {
+		g := NewWithT(t)
+		p := policy()
+		p.SetName("some-other-policy")
+		before := fmt.Sprintf("%v", p.Object)
+		g.Expect(patchRemoteOtlpEgress(p, &maasv1alpha1.RemoteOtlpConfig{Endpoint: "https://h/x"})).To(Succeed())
+		g.Expect(fmt.Sprintf("%v", p.Object)).To(Equal(before))
+	})
 }

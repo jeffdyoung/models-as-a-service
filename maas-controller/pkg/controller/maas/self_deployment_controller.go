@@ -20,9 +20,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -75,6 +78,47 @@ const usageLogsTenancyProxyDeploymentName = "usage-logs-tenancy-proxy"
 // usageLogsTenancyProxyContainerName is the proxy container in the tenancy proxy Deployment.
 const usageLogsTenancyProxyContainerName = "proxy"
 
+// usageLogsCollectorEgressPolicyName is the egress NetworkPolicy rendered by the
+// usage-logs bundle. It permits DNS and the local LokiStack gateway only, so a
+// remote exporter times out until it is widened.
+const usageLogsCollectorEgressPolicyName = "usage-logs-collector-egress-restrict"
+
+// usageLogsCollectorName is the OpenTelemetryCollector rendered by the usage-logs bundle.
+const usageLogsCollectorName = "usage-logs"
+
+// Names used by the remote OTLP export added on top of the rendered collector.
+const (
+	// remoteOtlpExporterKey is the exporter added alongside otlp_http/loki.
+	remoteOtlpExporterKey = "otlphttp/remote"
+	// remoteOtlpPipelineKey is the pipeline carrying the remote export. It is
+	// separate from the local logs pipeline so the cluster identity processor
+	// cannot leak into the spoke-local write.
+	remoteOtlpPipelineKey = "logs/remote"
+	// remoteOtlpResourceProcessorKey stamps cluster identity on remote records only.
+	remoteOtlpResourceProcessorKey = "resource/remote"
+	// remoteOtlpCAVolumeName mounts the CA bundle used to verify the remote endpoint.
+	remoteOtlpCAVolumeName = "remote-otlp-ca"
+	// remoteOtlpTrustedCAConfigMap holds the cluster's trusted CA bundle, injected
+	// by the network operator. It is used when no caBundleSecret is supplied,
+	// because the collector's own trust store is replaced by the service CA mount
+	// and therefore cannot verify publicly trusted endpoints.
+	remoteOtlpTrustedCAConfigMap = "usage-logs-remote-trusted-ca"
+	// remoteOtlpCAMountPath is where that bundle is mounted in the collector.
+	remoteOtlpCAMountPath = "/etc/pki/remote-otlp-ca"
+	// remoteOtlpCAKey is the Secret key expected to hold the bundle.
+	remoteOtlpCAKey = "ca-bundle.crt"
+	// remoteOtlpEnvPrefix namespaces the env vars projected from headersSecret.
+	remoteOtlpEnvPrefix = "REMOTE_OTLP_HDR_"
+	// unknownClusterID / unknownClusterName are stamped when identity cannot be
+	// detected and no override was supplied, so records are still attributable
+	// to "a cluster we could not identify" rather than silently unlabelled.
+	unknownClusterID   = "unknown-cluster-id"
+	unknownClusterName = "unknown-cluster-name"
+)
+
+// remoteOtlpEnvSanitizer maps Secret keys onto legal environment variable names.
+var remoteOtlpEnvSanitizer = regexp.MustCompile(`[^A-Z0-9_]`)
+
 // LifecycleReconciler watches the maas-controller Deployment. It is the sole creator of the
 // cluster-scoped Config/default anchor when the Deployment exists and is not terminating (so
 // standalone installs do not race applying a Config manifest before the Config CRD is ready).
@@ -87,6 +131,11 @@ const usageLogsTenancyProxyContainerName = "proxy"
 // ownerReference (set by older maas-controller versions) are removed when present.
 type LifecycleReconciler struct {
 	client.Client
+	// APIReader performs uncached reads. The manager's Secret informer is
+	// deliberately scoped to the infrastructure namespace, so Secrets elsewhere
+	// — such as the remote-OTLP headersSecret in the monitoring namespace —
+	// must be read directly rather than through the cache.
+	APIReader                   client.Reader
 	Scheme                      *runtime.Scheme
 	DeploymentName              string
 	DeploymentNS                string
@@ -115,6 +164,9 @@ type LifecycleReconciler struct {
 //+kubebuilder:rbac:groups=maas.opendatahub.io,resources=maastenantconfigs,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=maas.opendatahub.io,resources=aitenants,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+//+kubebuilder:rbac:groups=cluster.open-cluster-management.io,resources=clusterclaims,verbs=get;list;watch
+//+kubebuilder:rbac:groups=operator.open-cluster-management.io,resources=klusterlets,verbs=get;list;watch
 //+kubebuilder:rbac:groups=perses.dev,resources=persesdashboards;persesdatasources,verbs=get;list;watch;create;patch;delete
 //+kubebuilder:rbac:groups=opentelemetry.io,resources=opentelemetrycollectors,verbs=get;list;watch;create;patch;delete
 //+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings;rolebindings,verbs=get;list;watch;create;patch;delete
@@ -611,6 +663,71 @@ func (r *LifecycleReconciler) ensureUsageLogs(ctx context.Context, log logr.Logg
 		return fmt.Errorf("render inactive usage logs: %w", err)
 	}
 
+	// Remote OTLP export (RHAI-8084) is layered onto the rendered collector.
+	// usageLogging remains the feature gate: when it is false the usage-logs
+	// bundle is not rendered at all, so remoteOtlp cannot take effect.
+	var (
+		remoteOtlp        *maasv1alpha1.RemoteOtlpConfig
+		remoteHeaderKeys  []string
+		remoteClusterID   string
+		remoteClusterName string
+	)
+	if usageLogging && cfg.Spec.UsageLogs != nil && cfg.Spec.UsageLogs.RemoteOtlp != nil {
+		remote := cfg.Spec.UsageLogs.RemoteOtlp
+		keys, err := r.remoteOtlpHeaderKeys(ctx, remote)
+		if err != nil {
+			// Surface the problem and leave the local pipeline rendering. A bad
+			// remote reference must not take spoke-local usage logging down with it.
+			apimeta.SetStatusCondition(&cfg.Status.Conditions, metav1.Condition{
+				Type:    maasv1alpha1.ConfigConditionRemoteUsageLogsConfigured,
+				Status:  metav1.ConditionFalse,
+				Reason:  "HeadersSecretUnusable",
+				Message: err.Error(),
+			})
+			if statusErr := r.Status().Update(ctx, &cfg); statusErr != nil {
+				log.Error(statusErr, "update Config status after headersSecret failure")
+			}
+			log.Error(err, "remote usage-log export disabled")
+		} else {
+			remoteOtlp = remote
+			remoteHeaderKeys = keys
+			remoteClusterID, remoteClusterName = r.resolveClusterIdentity(ctx, remote.Attributes)
+			if remote.TLS == nil || remote.TLS.CABundleSecret == "" {
+				if caErr := r.ensureRemoteOtlpTrustedCA(ctx, &cfg); caErr != nil {
+					log.Error(caErr, "ensure trusted CA bundle for remote usage-log export")
+				}
+			}
+			apimeta.SetStatusCondition(&cfg.Status.Conditions, metav1.Condition{
+				Type:   maasv1alpha1.ConfigConditionRemoteUsageLogsConfigured,
+				Status: metav1.ConditionTrue,
+				Reason: "Configured",
+				Message: fmt.Sprintf("Exporting usage logs to %s as cluster_id=%s cluster_name=%s",
+					remote.Endpoint, remoteClusterID, remoteClusterName),
+			})
+			if statusErr := r.Status().Update(ctx, &cfg); statusErr != nil {
+				log.Error(statusErr, "update Config status after configuring remote export")
+			}
+		}
+	} else {
+		// Clean removal: unsetting remoteOtlp drops the condition along with the
+		// exporter and pipeline, which simply stop being rendered. The trusted-CA
+		// ConfigMap is not rendered from the bundle, so nothing stops reconciling
+		// it — it has to be deleted explicitly. It is owned by the Config and so
+		// would be collected eventually, but leaving a ~220KB ConfigMap that the
+		// network operator keeps refreshing is not a clean removal.
+		if caErr := r.removeRemoteOtlpTrustedCA(ctx); caErr != nil {
+			log.Error(caErr, "remove trusted CA bundle after disabling remote usage-log export")
+		}
+		if apimeta.FindStatusCondition(cfg.Status.Conditions,
+			maasv1alpha1.ConfigConditionRemoteUsageLogsConfigured) != nil {
+			apimeta.RemoveStatusCondition(&cfg.Status.Conditions,
+				maasv1alpha1.ConfigConditionRemoteUsageLogsConfigured)
+			if statusErr := r.Status().Update(ctx, &cfg); statusErr != nil {
+				log.Error(statusErr, "update Config status after removing remote export")
+			}
+		}
+	}
+
 	// Track if the collector is skipped due to missing CRD (CWE-863).
 	// If the OpenTelemetryCollector CRD is unavailable, we must skip the entire
 	// bundle to prevent orphaned ClusterRoleBinding from granting cluster-logging-application-write
@@ -627,6 +744,15 @@ func (r *LifecycleReconciler) ensureUsageLogs(ctx context.Context, log logr.Logg
 		}
 		if err := patchPersesDatasourceURL(&res); err != nil {
 			return fmt.Errorf("patch %s %s: %w", res.GetKind(), res.GetName(), err)
+		}
+		if remoteOtlp != nil {
+			if err := patchRemoteOtlpExporter(&res, remoteOtlp, remoteHeaderKeys,
+				remoteClusterID, remoteClusterName); err != nil {
+				return fmt.Errorf("patch %s %s: %w", res.GetKind(), res.GetName(), err)
+			}
+			if err := patchRemoteOtlpEgress(&res, remoteOtlp); err != nil {
+				return fmt.Errorf("patch %s %s: %w", res.GetKind(), res.GetName(), err)
+			}
 		}
 		if err := controllerutil.SetControllerReference(&cfg, &res, r.Scheme); err != nil {
 			return fmt.Errorf("set controller reference on %s %s: %w", res.GetKind(), res.GetName(), err)
@@ -844,6 +970,354 @@ func patchTenancyProxyImage(res *unstructured.Unstructured) error {
 	}
 
 	return errors.New("proxy container not found in usage-logs-tenancy-proxy deployment")
+}
+
+// remoteOtlpEnvVarName derives a legal environment variable name for a
+// headersSecret key, so that "X-Scope-OrgID" becomes REMOTE_OTLP_HDR_X_SCOPE_ORGID.
+func remoteOtlpEnvVarName(key string) string {
+	return remoteOtlpEnvPrefix + remoteOtlpEnvSanitizer.ReplaceAllString(strings.ToUpper(key), "_")
+}
+
+// patchRemoteOtlpEgress widens the usage-logs egress NetworkPolicy so the remote
+// exporter can reach its endpoint. Without this the export fails as a *timeout*
+// rather than a refusal — NetworkPolicy drops packets silently — which looks
+// like an unresponsive receiver rather than a local policy.
+//
+// The rule is deliberately broad. A remote endpoint is typically a Route behind
+// a cloud load balancer whose addresses cannot be pinned, so there is no stable
+// CIDR to allow. Link-local is excluded to keep the cloud metadata endpoint out
+// of reach, which is the single most valuable restriction retained.
+func patchRemoteOtlpEgress(res *unstructured.Unstructured, remote *maasv1alpha1.RemoteOtlpConfig) error {
+	if res.GetKind() != "NetworkPolicy" || res.GetName() != usageLogsCollectorEgressPolicyName {
+		return nil
+	}
+
+	port, err := remoteOtlpPort(remote.Endpoint)
+	if err != nil {
+		return err
+	}
+
+	egress, _, err := unstructured.NestedSlice(res.Object, "spec", "egress")
+	if err != nil {
+		return fmt.Errorf("read egress in %s: %w", usageLogsCollectorEgressPolicyName, err)
+	}
+	egress = append(egress, map[string]any{
+		"to": []any{
+			map[string]any{
+				"ipBlock": map[string]any{
+					"cidr":   "0.0.0.0/0",
+					"except": []any{"169.254.0.0/16"},
+				},
+			},
+		},
+		"ports": []any{
+			map[string]any{"protocol": "TCP", "port": port},
+		},
+	})
+	if err := unstructured.SetNestedSlice(res.Object, egress, "spec", "egress"); err != nil {
+		return fmt.Errorf("set egress in %s: %w", usageLogsCollectorEgressPolicyName, err)
+	}
+	return nil
+}
+
+// remoteOtlpPort returns the TCP port implied by the endpoint URL.
+func remoteOtlpPort(endpoint string) (int64, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return 0, fmt.Errorf("parse remote endpoint %q: %w", endpoint, err)
+	}
+	if p := u.Port(); p != "" {
+		n, err := strconv.ParseInt(p, 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("parse port in remote endpoint %q: %w", endpoint, err)
+		}
+		return n, nil
+	}
+	if u.Scheme == "http" {
+		return 80, nil
+	}
+	return 443, nil
+}
+
+// resolveClusterIdentity determines the cluster_id and cluster_name stamped on
+// remote records. Explicit overrides win; otherwise identity is read from ACM's
+// ClusterClaim and Klusterlet.
+//
+// Both lookups are best-effort. On a cluster not managed by ACM neither object
+// exists, and the CRDs may not be registered at all, so failures fall through to
+// placeholders rather than blocking the export: an attributable-but-unknown
+// record is more useful than no record.
+func (r *LifecycleReconciler) resolveClusterIdentity(
+	ctx context.Context,
+	overrides *maasv1alpha1.RemoteOtlpAttributesConfig,
+) (clusterID, clusterName string) {
+	if overrides != nil {
+		clusterID = overrides.ClusterID
+		clusterName = overrides.ClusterName
+	}
+
+	readClaim := func(name string) string {
+		claim := &unstructured.Unstructured{}
+		claim.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "cluster.open-cluster-management.io",
+			Version: "v1alpha1",
+			Kind:    "ClusterClaim",
+		})
+		if err := r.Get(ctx, client.ObjectKey{Name: name}, claim); err != nil {
+			return ""
+		}
+		value, found, err := unstructured.NestedString(claim.Object, "spec", "value")
+		if err != nil || !found {
+			return ""
+		}
+		return value
+	}
+
+	if clusterID == "" {
+		clusterID = readClaim("id.k8s.io")
+	}
+
+	if clusterName == "" {
+		klusterlet := &unstructured.Unstructured{}
+		klusterlet.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "operator.open-cluster-management.io",
+			Version: "v1",
+			Kind:    "Klusterlet",
+		})
+		if err := r.Get(ctx, client.ObjectKey{Name: "klusterlet"}, klusterlet); err == nil {
+			if value, found, err := unstructured.NestedString(klusterlet.Object, "spec", "clusterName"); err == nil && found {
+				clusterName = value
+			}
+		}
+	}
+	if clusterName == "" {
+		clusterName = readClaim("kubernetes.io/cluster-name")
+	}
+
+	if clusterID == "" {
+		clusterID = unknownClusterID
+	}
+	if clusterName == "" {
+		clusterName = unknownClusterName
+	}
+	return clusterID, clusterName
+}
+
+// ensureRemoteOtlpTrustedCA creates the ConfigMap that the network operator fills
+// with the cluster's trusted CA bundle. It is needed because the usage-logs
+// collector mounts the service CA over the system trust path, leaving it unable
+// to verify publicly trusted endpoints on its own. Only used when the caller did
+// not supply their own caBundleSecret.
+func (r *LifecycleReconciler) ensureRemoteOtlpTrustedCA(ctx context.Context, cfg *maasv1alpha1.Config) error {
+	cm := &unstructured.Unstructured{}
+	cm.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"})
+	cm.SetName(remoteOtlpTrustedCAConfigMap)
+	cm.SetNamespace(r.MonitoringNamespace)
+	// The cluster network operator fills this from a LABEL, not an annotation —
+	// unlike the service-CA injector next door, which uses an annotation. Getting
+	// the two confused yields an empty ConfigMap and a mount with no ca-bundle.crt.
+	cm.SetLabels(map[string]string{
+		"app.kubernetes.io/part-of":                   "maas-observability",
+		"app.kubernetes.io/managed-by":                "maas-controller",
+		"config.openshift.io/inject-trusted-cabundle": "true",
+	})
+	if err := controllerutil.SetControllerReference(cfg, cm, r.Scheme); err != nil {
+		return fmt.Errorf("set controller reference on %s: %w", remoteOtlpTrustedCAConfigMap, err)
+	}
+	if err := r.Apply(ctx, client.ApplyConfigurationFromUnstructured(cm),
+		client.ForceOwnership, client.FieldOwner("maas-controller")); err != nil {
+		return fmt.Errorf("apply %s: %w", remoteOtlpTrustedCAConfigMap, err)
+	}
+	return nil
+}
+
+// removeRemoteOtlpTrustedCA deletes the injected trusted-CA ConfigMap. Safe to
+// call when it does not exist, which is the common case.
+func (r *LifecycleReconciler) removeRemoteOtlpTrustedCA(ctx context.Context) error {
+	cm := &unstructured.Unstructured{}
+	cm.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"})
+	cm.SetName(remoteOtlpTrustedCAConfigMap)
+	cm.SetNamespace(r.MonitoringNamespace)
+	if err := r.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete %s: %w", remoteOtlpTrustedCAConfigMap, err)
+	}
+	return nil
+}
+
+// remoteOtlpHeaderKeys validates the referenced headersSecret and returns its
+// sorted key names. Keys are sorted so the rendered collector is stable across
+// reconciles and does not churn the object on every apply.
+func (r *LifecycleReconciler) remoteOtlpHeaderKeys(
+	ctx context.Context,
+	remote *maasv1alpha1.RemoteOtlpConfig,
+) ([]string, error) {
+	secret := &corev1.Secret{}
+	key := client.ObjectKey{Namespace: r.MonitoringNamespace, Name: remote.HeadersSecret}
+	// Uncached: see APIReader on LifecycleReconciler.
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	if err := reader.Get(ctx, key, secret); err != nil {
+		return nil, fmt.Errorf("headersSecret %q in namespace %q: %w",
+			remote.HeadersSecret, r.MonitoringNamespace, err)
+	}
+	if len(secret.Data) == 0 {
+		return nil, fmt.Errorf("headersSecret %q contains no data keys", remote.HeadersSecret)
+	}
+	keys := make([]string, 0, len(secret.Data))
+	for k := range secret.Data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
+
+// patchRemoteOtlpExporter adds a second OTLP/HTTP exporter and its own pipeline to
+// the rendered usage-logs collector, leaving the spoke-local export untouched.
+//
+// It follows the same post-render shape as patchTenancyProxyImage: the collector
+// is static YAML from the kustomize bundle, so the remote export is layered on
+// here rather than expressed in the manifest.
+//
+// headerKeys are the keys of the referenced Secret, already read and validated by
+// the caller. Only the key names are needed: each value is projected as an
+// environment variable and referenced as ${env:...}, so no secret material is
+// written into the collector spec.
+func patchRemoteOtlpExporter(
+	res *unstructured.Unstructured,
+	remote *maasv1alpha1.RemoteOtlpConfig,
+	headerKeys []string,
+	clusterID, clusterName string,
+) error {
+	if res.GetKind() != "OpenTelemetryCollector" || res.GetName() != usageLogsCollectorName {
+		return nil
+	}
+
+	exporters, found, err := unstructured.NestedMap(res.Object, "spec", "config", "exporters")
+	if err != nil || !found {
+		return fmt.Errorf("read exporters in %s collector: %w", usageLogsCollectorName, err)
+	}
+	processors, found, err := unstructured.NestedMap(res.Object, "spec", "config", "processors")
+	if err != nil || !found {
+		return fmt.Errorf("read processors in %s collector: %w", usageLogsCollectorName, err)
+	}
+	pipelines, found, err := unstructured.NestedMap(res.Object, "spec", "config", "service", "pipelines")
+	if err != nil || !found {
+		return fmt.Errorf("read pipelines in %s collector: %w", usageLogsCollectorName, err)
+	}
+
+	// Headers reference environment variables rather than carrying values.
+	headers := map[string]any{}
+	env, _, err := unstructured.NestedSlice(res.Object, "spec", "env")
+	if err != nil {
+		return fmt.Errorf("read env in %s collector: %w", usageLogsCollectorName, err)
+	}
+	for _, key := range headerKeys {
+		varName := remoteOtlpEnvVarName(key)
+		headers[key] = fmt.Sprintf("${env:%s}", varName)
+		env = append(env, map[string]any{
+			"name": varName,
+			"valueFrom": map[string]any{
+				"secretKeyRef": map[string]any{
+					"name": remote.HeadersSecret,
+					"key":  key,
+				},
+			},
+		})
+	}
+	if err := unstructured.SetNestedSlice(res.Object, env, "spec", "env"); err != nil {
+		return fmt.Errorf("set env in %s collector: %w", usageLogsCollectorName, err)
+	}
+
+	exporter := map[string]any{
+		"endpoint": remote.Endpoint,
+		"headers":  headers,
+	}
+
+	// Trust for the remote endpoint. The collector mounts the service CA over
+	// /etc/pki/ca-trust/extracted/pem, which shadows the image's public bundle, so
+	// it cannot verify a publicly trusted endpoint without being given a bundle
+	// explicitly. Use the caller's Secret when supplied, otherwise the cluster's
+	// injected trusted bundle.
+	{
+		volumes, _, err := unstructured.NestedSlice(res.Object, "spec", "volumes")
+		if err != nil {
+			return fmt.Errorf("read volumes in %s collector: %w", usageLogsCollectorName, err)
+		}
+		caVolume := map[string]any{
+			"name":      remoteOtlpCAVolumeName,
+			"configMap": map[string]any{"name": remoteOtlpTrustedCAConfigMap},
+		}
+		if remote.TLS != nil && remote.TLS.CABundleSecret != "" {
+			caVolume = map[string]any{
+				"name":   remoteOtlpCAVolumeName,
+				"secret": map[string]any{"secretName": remote.TLS.CABundleSecret},
+			}
+		}
+		volumes = append(volumes, caVolume)
+		if err := unstructured.SetNestedSlice(res.Object, volumes, "spec", "volumes"); err != nil {
+			return fmt.Errorf("set volumes in %s collector: %w", usageLogsCollectorName, err)
+		}
+
+		mounts, _, err := unstructured.NestedSlice(res.Object, "spec", "volumeMounts")
+		if err != nil {
+			return fmt.Errorf("read volumeMounts in %s collector: %w", usageLogsCollectorName, err)
+		}
+		mounts = append(mounts, map[string]any{
+			"name":      remoteOtlpCAVolumeName,
+			"mountPath": remoteOtlpCAMountPath,
+			"readOnly":  true,
+		})
+		if err := unstructured.SetNestedSlice(res.Object, mounts, "spec", "volumeMounts"); err != nil {
+			return fmt.Errorf("set volumeMounts in %s collector: %w", usageLogsCollectorName, err)
+		}
+
+		exporter["tls"] = map[string]any{
+			"ca_file": fmt.Sprintf("%s/%s", remoteOtlpCAMountPath, remoteOtlpCAKey),
+		}
+	}
+
+	exporters[remoteOtlpExporterKey] = exporter
+
+	// Cluster identity is stamped by a processor used only by the remote
+	// pipeline, so it cannot reach the spoke-local LokiStack.
+	//
+	// Both actions must be `upsert`, not `insert`. The gateway access log already
+	// carries a `cluster_name` resource attribute holding the *Envoy* upstream
+	// cluster (e.g. "maas-default-gateway-openshift-default.openshift-ingress"),
+	// which has nothing to do with the Kubernetes cluster. `insert` is a no-op on
+	// an existing key, so it would leave that value in place and silently
+	// misattribute every record on the hub.
+	processors[remoteOtlpResourceProcessorKey] = map[string]any{
+		"attributes": []any{
+			map[string]any{"key": "cluster_id", "value": clusterID, "action": "upsert"},
+			map[string]any{"key": "cluster_name", "value": clusterName, "action": "upsert"},
+		},
+	}
+
+	// The remote pipeline runs the bundle's own `resource` processor as well as
+	// `resource/remote`. Without the former, remote records lose log_type,
+	// service.name and kubernetes_namespace_name — and log_type is one of the
+	// handful of attributes Loki promotes to an index label, so records arrive
+	// but the documented query misses them. `resource/remote` stays exclusive to
+	// this pipeline so cluster identity never reaches the local write.
+	pipelines[remoteOtlpPipelineKey] = map[string]any{
+		"receivers":  []any{"otlp"},
+		"processors": []any{"memory_limiter", "resource", remoteOtlpResourceProcessorKey, "batch"},
+		"exporters":  []any{remoteOtlpExporterKey},
+	}
+
+	if err := unstructured.SetNestedMap(res.Object, exporters, "spec", "config", "exporters"); err != nil {
+		return fmt.Errorf("set exporters in %s collector: %w", usageLogsCollectorName, err)
+	}
+	if err := unstructured.SetNestedMap(res.Object, processors, "spec", "config", "processors"); err != nil {
+		return fmt.Errorf("set processors in %s collector: %w", usageLogsCollectorName, err)
+	}
+	if err := unstructured.SetNestedMap(res.Object, pipelines, "spec", "config", "service", "pipelines"); err != nil {
+		return fmt.Errorf("set pipelines in %s collector: %w", usageLogsCollectorName, err)
+	}
+	return nil
 }
 
 // tenantsHealthReason enumerates reasons used for ConfigConditionTenantsHealthy.
