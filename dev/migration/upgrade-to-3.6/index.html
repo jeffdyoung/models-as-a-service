@@ -773,10 +773,21 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#token-rate-limit-counters-reset" class="md-nav__link">
+  <a href="#existing-subscriptions-keep-their-live-quotas" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Token rate-limit counters reset
+        Existing subscriptions keep their live quotas
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#trade-off-size-savings-only-accrue-on-new-subscriptions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Trade-off: size savings only accrue on new subscriptions
       
     </span>
   </a>
@@ -795,10 +806,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#ipp-praxis-plugins-configmap-migration-gate" class="md-nav__link">
+  <a href="#ipp-praxis-api-translation-migration" class="md-nav__link">
     <span class="md-ellipsis">
       
-        IPP → Praxis plugins ConfigMap migration gate
+        IPP → Praxis API translation migration
       
     </span>
   </a>
@@ -3279,10 +3290,21 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#token-rate-limit-counters-reset" class="md-nav__link">
+  <a href="#existing-subscriptions-keep-their-live-quotas" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Token rate-limit counters reset
+        Existing subscriptions keep their live quotas
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#trade-off-size-savings-only-accrue-on-new-subscriptions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Trade-off: size savings only accrue on new subscriptions
       
     </span>
   </a>
@@ -3301,10 +3323,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#ipp-praxis-plugins-configmap-migration-gate" class="md-nav__link">
+  <a href="#ipp-praxis-api-translation-migration" class="md-nav__link">
     <span class="md-ellipsis">
       
-        IPP → Praxis plugins ConfigMap migration gate
+        IPP → Praxis API translation migration
       
     </span>
   </a>
@@ -3345,50 +3367,120 @@
 <h1 id="upgrade-to-36">Upgrade to 3.6</h1>
 <h2 id="recommended-downtime">Recommended downtime</h2>
 <p>When upgrading from RHOAI <strong>3.5</strong> to <strong>3.6</strong>, schedule a <strong>short maintenance window</strong>.</p>
-<p>MaaS rewrites gateway <code>AuthPolicy</code> identity fields and per-model <code>TokenRateLimitPolicy</code> predicates so rate limiting matches a short subscription rate-limit ID from maas-api. Until maas-api, Authorino’s subscription-info cache, and the controller-managed policies are all on the new contract, rate-limit matching can briefly fail open. A small planned downtime (or a traffic pause through the gateway) avoids that window.</p>
-<h2 id="token-rate-limit-counters-reset">Token rate-limit counters reset</h2>
-<p>On upgrade, TRLP limit map keys change from per-subscription names
-(<code>{namespace}-{subscription}-{model}-tokens</code>) to rate-grouped names
-(<code>tokens-{limit}-per-{window}</code>), and Limitador counters switch from
-<code>selected_subscription_key</code> to the short <code>selected_subscription_id</code>.</p>
-<p>Limitador <strong>enforcement</strong> counters for those limits start fresh: in-window token usage against subscription quotas resets. Users may see a one-time “full budget again” effect after upgrade until the next window elapses.</p>
-<p>This does <strong>not</strong> rewrite or invalidate historical <strong>Prometheus</strong> or <strong>Loki</strong> usage data. Telemetry labels continue to use the human-readable subscription name (<code>auth.identity.selected_subscription</code> / <code>X-MaaS-Subscription</code>), not the rate-limit ID. Pre-upgrade series and logs remain queryable under the same subscription labels; only live Limitador quota state is affected.</p>
+<p>MaaS rewrites gateway <code>AuthPolicy</code> identity fields and per-model <code>TokenRateLimitPolicy</code> predicates so <strong>new</strong> subscriptions can rate-limit on a short ID from maas-api. Until maas-api, Authorino’s subscription-info cache, and the controller-managed policies are all on the new contract, rate-limit matching for those new subscriptions can briefly fail open. A small planned downtime (or a traffic pause through the gateway) avoids that window.</p>
+<p>Existing subscriptions keep matching on <code>selected_subscription_key</code> and do not depend on <code>rateLimitId</code> being present.</p>
+<h2 id="existing-subscriptions-keep-their-live-quotas">Existing subscriptions keep their live quotas</h2>
+<p>Subscriptions that already exist at upgrade time stay on the pre-1546 identity:</p>
+<ul>
+<li>TRLP <strong><code>when</code></strong> predicates and Limitador <strong>counters</strong> continue to use <code>auth.identity.selected_subscription_key</code>.</li>
+<li>maas-api does <strong>not</strong> return <code>rateLimitId</code> for those CRs.</li>
+<li>The controller stamps <code>status.rateLimitIdentity: legacy</code> so a later reconcile cannot silently switch them to short IDs. Status is ignored by GitOps diffing by default, so the stamp does not flap OutOfSync.</li>
+</ul>
+<p>Subscriptions <strong>created after</strong> the 3.6 controller is running are stamped <code>status.rateLimitIdentity: short</code>. Those use <code>selected_subscription_id</code> (16-hex SHA-256 of <code>namespace/name@modelNs/model</code>) for matching and counters, and may expose <code>X-MaaS-Subscription-Rate-Limit-Id</code> when select returns <code>rateLimitId</code>.</p>
+<p>Delete-and-recreate of an old subscription is treated as a <strong>new</strong> CR: it opts into short IDs and starts a <strong>fresh</strong> Limitador counter for that subscription. In-place spec edits do not migrate identity unless <code>spec.rateLimitIdentity</code> is set.</p>
+<p>Explicitly setting <code>spec.rateLimitIdentity</code> to <code>short</code> or <code>legacy</code> is allowed as an operator escape hatch, but <strong>also resets that subscription’s in-window Limitador counter</strong> because the TRLP predicate and counter expression change. Unknown values are rejected by the CRD / validating webhook. Clearing the spec field leaves the sticky <code>status.rateLimitIdentity</code> unchanged.</p>
+<h2 id="trade-off-size-savings-only-accrue-on-new-subscriptions">Trade-off: size savings only accrue on new subscriptions</h2>
+<p>Short IDs exist to keep long <code>namespace/name@modelNs/model</code> strings out of Kuadrant WASM / EnvoyFilter predicates (the ~1.5 MiB object-size problem). Grandfathering existing CRs buys quota continuity at the cost of that size win:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Existing subscriptions</th>
+<th>Subscriptions created after upgrade</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TRLP match / counters</td>
+<td><code>selected_subscription_key</code> (long string in each predicate clause)</td>
+<td><code>selected_subscription_id</code> (16 hex chars)</td>
+</tr>
+<tr>
+<td>Live Limitador quota</td>
+<td>Unchanged by the identity change</td>
+<td>Starts at zero (correct for a new CR)</td>
+</tr>
+<tr>
+<td>EnvoyFilter / WasmPlugin size</td>
+<td>Still pays the long-key clause cost</td>
+<td>Compact clauses</td>
+</tr>
+</tbody>
+</table>
+<p>Further costs while a cluster has both generations:</p>
+<ul>
+<li><strong>A mixed-rate group splits into two TRLP limits</strong> (<code>tokens-{limit}-per-{window}</code> for legacy members, <code>tokens-{limit}-per-{window}-id</code> for short-ID members). Kuadrant copies every limit into every route-match ActionSet, so mixed generations partially undo rate grouping (see <a href="../../advanced-administration/subscription-cardinality/#gateway-config-size">Subscription Cardinality</a>) until the legacy members are gone.</li>
+<li>There is <strong>no automatic backfill</strong>. To reclaim the size win for an old subscription you must recreate it (or set <code>spec.rateLimitIdentity: short</code>), which <strong>resets that subscription’s in-window quota</strong>.</li>
+<li>Historical <strong>Prometheus</strong> and <strong>Loki</strong> usage is unaffected either way. Telemetry still labels by subscription name (<code>auth.identity.selected_subscription</code> / <code>X-MaaS-Subscription</code>).</li>
+</ul>
+<p>If the cluster still uses per-subscription TRLP limit names from before rate grouping, those names still change to <code>tokens-{limit}-per-{window}</code> on upgrade. That rename is independent of short IDs and can still start fresh Limitador counters for the current window.</p>
 <h2 id="what-else-to-know">What else to know</h2>
 <ul>
-<li><code>auth.identity.selected_subscription_key</code> remains for telemetry and debugging.</li>
-<li>Rate limiting matches <code>auth.identity.selected_subscription_id</code> (see <a href="../../architecture-internals/authentication-internals/">Authentication Internals</a>).</li>
-<li>Response header <code>X-MaaS-Subscription-Rate-Limit-Id</code> may be injected when select returns <code>rateLimitId</code>. Gateway AuthPolicy rejects inbound client values for that header; also ensure Praxis / identity-header strip configs treat <code>x-maas-*</code> (prefix or explicit list) so it cannot be spoofed upstream.</li>
+<li><code>auth.identity.selected_subscription_key</code> remains for telemetry and debugging, and is still the rate-limit identity for legacy subscriptions.</li>
+<li>Rate limiting for <strong>new</strong> subscriptions matches <code>auth.identity.selected_subscription_id</code> (see <a href="../../architecture-internals/authentication-internals/">Authentication Internals</a>).</li>
+<li>Response header <code>X-MaaS-Subscription-Rate-Limit-Id</code> may be injected when select returns <code>rateLimitId</code> (new subscriptions only). Gateway AuthPolicy rejects inbound client values for that header; also ensure Praxis / identity-header strip configs treat <code>x-maas-*</code> (prefix or explicit list) so it cannot be spoofed upstream.</li>
 </ul>
-<h2 id="ipp-praxis-plugins-configmap-migration-gate">IPP → Praxis plugins ConfigMap migration gate</h2>
+<h2 id="ipp-praxis-api-translation-migration">IPP → Praxis API translation migration</h2>
 <p>When a tenant flips to Praxis (<code>maas.opendatahub.io/payload-processing-type=praxis</code>),
 maas-controller inspects the live <code>payload-processing-plugins</code> ConfigMap
 <strong>before</strong> deleting legacy IPP resources (<a href="https://issues.redhat.com/browse/RHOAIENG-98846">RHOAIENG-98846</a>):</p>
 <table>
 <thead>
 <tr>
-<th>Live ConfigMap</th>
+<th>RHOAI 3.5 ConfigMap</th>
 <th>Behavior</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Product default (request <code>api-translation</code>, empty response chain)</td>
-<td>Auto-migrate</td>
+<td>Exact product default</td>
+<td>IPP already translated requests. <code>spec.apiTranslation.enabled</code> stays omitted/off for a new Praxis tenant. Cleanup proceeds only when active ExternalModels use OpenAI Chat Completions passthrough.</td>
 </tr>
 <tr>
-<td>Default + response <code>api-translation</code> enabled</td>
-<td>Auto-migrate</td>
+<td>Exact default plus response <code>api-translation</code></td>
+<td>IPP translated requests and responses. Before cleanup, maas-controller durably writes <code>spec.apiTranslation.enabled: true</code>, unless an operator already set the field. The compatibility check still applies.</td>
 </tr>
 <tr>
-<td>Default + customer metering plugin</td>
-<td>Not fingerprinted yet — treated as non-standard until a 3.5 example is collected</td>
-</tr>
-<tr>
-<td>Any other customization</td>
-<td>Migration <strong>blocked</strong></td>
+<td>Unknown or customized ConfigMap</td>
+<td>Migration <strong>blocked</strong>; the controller does not infer equivalent Praxis behavior.</td>
 </tr>
 </tbody>
 </table>
+<p>The legacy IPP request translator was a multi-provider catch-all documented for
+OpenAI, Anthropic, Azure OpenAI, Vertex AI, and Bedrock Mantle. Praxis currently
+qualifies only OpenAI <code>openai-chat</code> pass-through and Anthropic <code>messages</code>
+translation for ExternalModels. The <code>apiTranslation</code> permission is not a
+tenant-wide translator choice: it permits both the shared <strong>Anthropic Messages
+client → OpenAI-compatible backend</strong> flow and the ExternalModel <strong>OpenAI Chat
+Completions client → selected Anthropic Messages provider</strong> flow. In the
+ExternalModel path, <code>intelligent_route</code> selects the provider per request, and
+the selected provider's profile remains bound through request and response
+translation. OpenAI-compatible candidates remain pass-through.</p>
+<p>An active Azure OpenAI, Vertex AI, Bedrock, custom provider, or unqualified
+format/auth binding is not claimed as compatible. The AIGC resolver fails that
+reconcile before publishing or cleaning serving resources, preserving the
+last-known route and overlay; the migration compatibility check likewise must
+keep IPP state until that binding is qualified or an operator explicitly
+accepts the compatibility risk. A passing shared <code>/v1/messages</code> request does
+not prove ExternalModel compatibility, and a recognized IPP ConfigMap
+fingerprint alone does not prove every historical provider direction.</p>
+<p>The pure-default IPP ConfigMap already enabled request-side <code>api-translation</code>;
+its response chain was empty. Baseline #2 added response-side processing.
+Recognizing either fingerprint preserves that migration intent, but does not
+prove support for every provider or response mode. The recognized fingerprints
+and migration decisions are intentionally strict.</p>
+<p>For a recognized ConfigMap baseline, an explicit
+<code>spec.apiTranslation.enabled: false</code> accepts the compatibility loss for an
+unsupported active ExternalModel and lets cleanup proceed. It does not bypass
+the fingerprint check for a customized ConfigMap. The force annotation below
+can bypass that separate check. Both choices accept compatibility risk; they
+are overrides, not parity. Review and test affected model/provider bindings
+before using them. MaaS records an accepted risk on <code>MaasTenantConfig</code> and keeps
+it in the <code>Degraded</code> condition after the one-shot cleanup while affected
+provider bindings remain active. The warning clears when no active
+ExternalModel needs the unsupported legacy transform. Forced cleanup of a
+customized ConfigMap retains a warning that the migration does not establish
+IPP parity.</p>
 <p>While blocked:</p>
 <ul>
 <li><code>MaasTenantConfig</code> stays <code>Ready=False</code> with a message naming the force annotation</li>
@@ -3402,9 +3494,12 @@ does not retain the previous custom data:</p>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>kubectl<span class="w"> </span>annotate<span class="w"> </span>maastenantconfig<span class="w"> </span>default-tenant<span class="w"> </span>-n<span class="w"> </span>&lt;tenant-namespace&gt;<span class="w"> </span><span class="se">\</span>
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span>maas.opendatahub.io/force-payload-processing-migration<span class="o">=</span><span class="nb">true</span><span class="w"> </span>--overwrite
 </code></pre></div>
-<p>Known-good ConfigMaps do <strong>not</strong> need the force annotation. Applying force on a
-customized ConfigMap replaces it with the Praxis plugins schema; re-apply any
-still-needed customizations in the Praxis ConfigMap shape afterward.</p>
+<p>Known-good ConfigMaps do <strong>not</strong> need the force annotation when their active
+ExternalModels are compatible. Applying force on a customized ConfigMap
+replaces it with the Praxis plugins schema; re-apply any still-needed
+customizations in the Praxis ConfigMap shape afterward. An override does not
+establish parity for Azure, Vertex, Bedrock, OpenAI variants, streaming, or
+other provider behavior without matching deployed evidence.</p>
 <h2 id="legacy-metrics-usage-dashboard-is-opt-in">Legacy metrics usage dashboard is opt-in</h2>
 <p><code>Config.spec.usageMetricsDashboard</code> defaults to <code>false</code>. After upgrade, the operator removes any controller-owned copy of the Prometheus-based Perses dashboard (<code>dashboard-3-maas-usage-admin</code>). To keep it:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>kubectl<span class="w"> </span>patch<span class="w"> </span>configs.maas.opendatahub.io<span class="w"> </span>default<span class="w"> </span>--type<span class="o">=</span>merge<span class="w"> </span><span class="se">\</span>
@@ -3433,7 +3528,7 @@ still-needed customizations in the Praxis ConfigMap shape afterward.</p>
     <span class="md-icon" title="Last update">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 13.1c-.1 0-.3.1-.4.2l-1 1 2.1 2.1 1-1c.2-.2.2-.6 0-.8l-1.3-1.3c-.1-.1-.2-.2-.4-.2m-1.9 1.8-6.1 6V23h2.1l6.1-6.1zM12.5 7v5.2l4 2.4-1 1L11 13V7zM11 21.9c-5.1-.5-9-4.8-9-9.9C2 6.5 6.5 2 12 2c5.3 0 9.6 4.1 10 9.3-.3-.1-.6-.2-1-.2s-.7.1-1 .2C19.6 7.2 16.2 4 12 4c-4.4 0-8 3.6-8 8 0 4.1 3.1 7.5 7.1 7.9l-.1.2z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="October 15, 2026 19:29:22 UTC">October 15, 2026</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="October 21, 2026 17:42:28 UTC">October 21, 2026</span>
   </span>
 
     

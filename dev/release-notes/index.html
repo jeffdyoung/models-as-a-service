@@ -3830,7 +3830,7 @@
 <td>TBD</td>
 <td><code>v3.6</code></td>
 <td>Planned</td>
-<td>Short subscription rate-limit IDs in TRLP; see <a href="../migration/upgrade-to-3.6/">Upgrade Guide</a></td>
+<td>Short rate-limit IDs for <strong>new</strong> subscriptions; existing CRs keep <code>selected_subscription_key</code>; see <a href="../migration/upgrade-to-3.6/">Upgrade Guide</a></td>
 </tr>
 <tr>
 <td>3.5</td>
@@ -3875,8 +3875,9 @@
 <p>See <a href="../migration/upgrade-to-3.6/">Upgrade to 3.6</a> for full guidance. Summary:</p>
 <ul>
 <li><strong><code>maas-api</code> egress default changed:</strong> When <code>networkPolicyEgressRules</code> is empty, new installs get DNS, Kubernetes API, and allow-all (<code>egress: - {}</code>). <strong>Upgrades preserve</strong> an existing restrictive operand policy (no allow-all rule) until an administrator sets <code>networkPolicyEgressRules</code> or deletes the policy. To adopt allow-all after upgrade, delete <code>maas-api-egress-restrict</code> and let the controller recreate it. <code>networkPolicyAdditionalEgressRules</code> does not remove allow-all. See <a href="../install/maas-setup/#postgresql-egress">PostgreSQL egress</a>.</li>
-<li><strong>Recommended short downtime</strong> when upgrading from 3.5 → 3.6 while AuthPolicy / TRLP / maas-api adopt short subscription rate-limit IDs (avoids a brief rate-limit fail-open window).</li>
-<li><strong>Token rate-limit counters reset</strong> on upgrade (limit keys become rate-grouped <code>tokens-*</code>, counters use <code>selected_subscription_id</code>). Limitador enforcement budgets start fresh for the current window.</li>
+<li><strong>Recommended short downtime</strong> when upgrading from 3.5 → 3.6 while AuthPolicy / TRLP / maas-api adopt short subscription rate-limit IDs for <strong>new</strong> subscriptions (avoids a brief rate-limit fail-open window for those CRs).</li>
+<li><strong>Existing subscriptions keep live Limitador quotas by default</strong> — they stay on <code>selected_subscription_key</code> matching and counters. Short IDs apply only to subscriptions created after upgrade. Continuity is <strong>not</strong> guaranteed when a CR is opted into <code>spec.rateLimitIdentity: short</code>, when it is recreated (also opts into short IDs), or when upgrade renames pre-rate-group per-subscription TRLP limits to <code>tokens-*</code> and starts fresh counters for the current window; see <a href="../migration/upgrade-to-3.6/">Upgrade to 3.6</a>.</li>
+<li><strong>Trade-off:</strong> EnvoyFilter / WasmPlugin size savings from short IDs accrue only as old subscriptions are replaced. A mixed-rate group splits into two TRLP limits until the legacy members are gone.</li>
 <li><strong>Prometheus and Loki usage history are unaffected</strong> — telemetry still labels by subscription name (<code>selected_subscription</code> / <code>X-MaaS-Subscription</code>), not the rate-limit ID.</li>
 <li><strong>IPP → Praxis plugins ConfigMap migration is gated:</strong> product-default ConfigMaps (and default + response <code>api-translation</code>) auto-migrate; customized ConfigMaps block until <code>maas.opendatahub.io/force-payload-processing-migration=true</code> is set on <code>MaasTenantConfig</code> (see <a href="../migration/upgrade-to-3.6/">Upgrade to 3.6</a>).</li>
 <li><strong>Legacy metrics usage dashboard is opt-in</strong> (<code>Config.spec.usageMetricsDashboard</code>, default <code>false</code>). The operator no longer deploys <code>dashboard-3-maas-usage-admin</code> unless this is set to <code>true</code>; existing operator-owned copies are removed on reconcile. See <a href="../migration/upgrade-to-3.6/">Upgrade to 3.6</a>.</li>
@@ -3884,7 +3885,7 @@
 <h3 id="key-fixes">Key Fixes</h3>
 <ul>
 <li>
-<p><strong>Short subscription rate-limit IDs in TokenRateLimitPolicy:</strong> TRLP <code>when</code> predicates and counters use a stable 16-hex SHA-256 of <code>namespace/name@modelNs/model</code> (<code>selected_subscription_id</code>) so Kuadrant WASM / EnvoyFilter size no longer embeds long subscription strings. Limit map keys stay rate-grouped (<code>tokens-&lt;limit&gt;-per-&lt;window&gt;</code>). Human-readable <code>selected_subscription_key</code> remains for telemetry.</p>
+<p><strong>Short subscription rate-limit IDs in TokenRateLimitPolicy (new subscriptions only):</strong> TRLP <code>when</code> predicates and counters for subscriptions created after upgrade use a stable 16-hex SHA-256 of <code>namespace/name@modelNs/model</code> (<code>selected_subscription_id</code>) so Kuadrant WASM / EnvoyFilter size no longer embeds long strings for those CRs. Pre-upgrade subscriptions keep <code>selected_subscription_key</code>. Limit map keys stay rate-grouped (<code>tokens-&lt;limit&gt;-per-&lt;window&gt;</code>). Human-readable <code>selected_subscription_key</code> remains for telemetry.</p>
 </li>
 <li>
 <p><strong>Consistent group-name validation, slashes now allowed on all paths:</strong> API-key minting and AuthPolicy enforcement previously disagreed about <code>/</code> in group names — API keys rejected <code>/</code> while the gateway allowed it, so behavior depended on which path was used. Both now enforce the same allowlist (<code>[A-Za-z0-9:#._/ -]</code>), the rule is defined once per component, and a mirrored test in each module fails if the copies drift. Users in IdP groups that contain <code>/</code> (Keycloak full-path groups, Entra ID, Okta, GitHub <code>org/team</code>) or <code>#</code> (for example IBM Cloud IAM names like <code>IAM#AccessGroupId-...</code>) can now mint and use API keys; requests with such groups previously failed with a validation error. Requests with unsafe OIDC group names are still rejected at the gateway with 403; when an invalid group name does reach the API-key handler, it now returns HTTP 400 with the allowed character set instead of an opaque 500. Identity headers now also select the group source by identity type (JWT <code>groups</code> claim vs OpenShift TokenReview <code>user.groups</code>) and gate both on the pattern, closing a claim-confusion path where a crafted JWT <code>user</code> claim could forge group names into <code>X-MaaS-Group</code>.</p>
@@ -4140,7 +4141,7 @@
     <span class="md-icon" title="Last update">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 13.1c-.1 0-.3.1-.4.2l-1 1 2.1 2.1 1-1c.2-.2.2-.6 0-.8l-1.3-1.3c-.1-.1-.2-.2-.4-.2m-1.9 1.8-6.1 6V23h2.1l6.1-6.1zM12.5 7v5.2l4 2.4-1 1L11 13V7zM11 21.9c-5.1-.5-9-4.8-9-9.9C2 6.5 6.5 2 12 2c5.3 0 9.6 4.1 10 9.3-.3-.1-.6-.2-1-.2s-.7.1-1 .2C19.6 7.2 16.2 4 12 4c-4.4 0-8 3.6-8 8 0 4.1 3.1 7.5 7.1 7.9l-.1.2z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="October 16, 2026 00:20:21 UTC">October 16, 2026</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="October 21, 2026 11:39:46 UTC">October 21, 2026</span>
   </span>
 
     

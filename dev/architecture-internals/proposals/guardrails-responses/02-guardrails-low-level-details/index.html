@@ -4284,13 +4284,14 @@ request. No AIGatewayPolicy or MaaS HTTP configuration endpoint is needed initia
 <p><a id="guardrail-check-identifier"></a></p>
 <p><strong>Check identity.</strong> Every check uses the same derivation, regardless of where it is attached:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>RENDER_CHECK_ID(namespace, guardrail, check) =
-<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>    lowercase_hex(SHA-256(UTF-8(compact_JSON([namespace, guardrail, check]))))
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>    lowercase_hex(SHA-256(UTF-8(namespace + &quot;:&quot; + guardrail + &quot;:&quot; + check)))
 <a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>
 <a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>header_name = &quot;x-aigateway-guardrail-&quot; + RENDER_CHECK_ID(namespace, guardrail, check)
 </code></pre></div>
-<p>The inputs are the AIGuardrail's namespace, <code>metadata.name</code> and <code>spec.checks[].name</code> (not the NeMo config ID). Compact
-JSON has no separator whitespace; preserve the exact input strings. All consumers use the same encoding. In the YAML
-examples, <code>RENDER_CHECK_ID(&lt;tenant-namespace&gt;,guardrail,check)</code> denotes a compiler substitution using the shown
+<p>The inputs are the AIGuardrail's namespace, <code>metadata.name</code> and <code>spec.checks[].name</code> (not the NeMo config ID). Join
+the exact input strings with <code>:</code> before hashing. Kubernetes resource and check names cannot contain <code>:</code>, so the
+encoding is unambiguous. All consumers use the same encoding. In the YAML examples,
+<code>RENDER_CHECK_ID(&lt;tenant-namespace&gt;,guardrail,check)</code> denotes a compiler substitution using the shown
 resource/check names. It is documentation notation, not a Praxis expression or a literal HTTP header name. Resolve the
 namespace placeholder and replace the whole expression with the digest before publishing configuration. There are N
 distinct headers for N configured checks, and repeated references to the same check reuse one header.</p>
@@ -4315,6 +4316,11 @@ authorization output may set flags; caller copies are rejected. Praxis validates
 catalog before protected work; unknown or unavailable checks reject the request rather than disappear through
 nonmatching conditions. MaaS is responsible for producing the complete mandatory set: the gateway does not reconstruct
 MaaS policy to infer missing requirements. Guardrail flag presence alone is not evidence that authorization occurred.</p>
+<p>The initial MaaS API handoff exposes this selection as <code>subscription-info.selectedGuardrailChecks</code>, a sparse map in the
+JSON response. Each key is a check identifier computed using the SHA-256 formula defined above, and each selected check
+has the value <code>true</code>. A configured resolver returns an empty map when no checks apply. If a selected attachment cannot
+be resolved, the API returns <code>guardrail_unavailable</code> without a partial selection. This field does not create request
+headers; those remain a separate integration contract.</p>
 <p><strong>Revision consistency.</strong> AI Gateway publishes the configured tenant catalog revision covering tenant identity and each
 configured AIGuardrail UID/generation, binding revision, check identity, phase and deterministic order. Runtime-only
 acknowledgments and volatile status timestamps do not change the content digest. MaaS obtains that catalog and verifies
@@ -5341,7 +5347,7 @@ transformations need an explicit API contract; do not infer them from reference 
     <span class="md-icon" title="Last update">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 13.1c-.1 0-.3.1-.4.2l-1 1 2.1 2.1 1-1c.2-.2.2-.6 0-.8l-1.3-1.3c-.1-.1-.2-.2-.4-.2m-1.9 1.8-6.1 6V23h2.1l6.1-6.1zM12.5 7v5.2l4 2.4-1 1L11 13V7zM11 21.9c-5.1-.5-9-4.8-9-9.9C2 6.5 6.5 2 12 2c5.3 0 9.6 4.1 10 9.3-.3-.1-.6-.2-1-.2s-.7.1-1 .2C19.6 7.2 16.2 4 12 4c-4.4 0-8 3.6-8 8 0 4.1 3.1 7.5 7.1 7.9l-.1.2z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="September 21, 2026 11:50:04 UTC">September 21, 2026</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="October 21, 2026 16:49:50 UTC">October 21, 2026</span>
   </span>
 
     
