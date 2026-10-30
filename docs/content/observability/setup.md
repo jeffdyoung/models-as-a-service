@@ -103,6 +103,71 @@ When tenant telemetry is enabled and `usageLogging` is `false` or omitted, `Maas
 - **Perses Dashboard** (`dashboard-4-maas-usage-logs-admin`) - usage dashboard for administrators (shows information on all users)
 - **Perses Dashboard** (`dashboard-5-maas-usage-logs`) - user-scoped usage dashboard
 
+#### Remote usage-log export (multi-cluster aggregation)
+
+When MaaS runs on managed spoke clusters, a copy of every usage record can be forwarded to an
+upstream OTLP/HTTP receiver — typically a LokiStack gateway on an ACM hub — so usage is
+queryable across the fleet. Configure it under `Config.spec.usageLogs.remoteOtlp`:
+
+```yaml
+spec:
+  usageLogging: true
+  usageLogs:
+    remoteOtlp:
+      endpoint: "https://usage-logs-hub.example.com/api/logs/v1/infrastructure/otlp"
+      headersSecret: "hub-usage-logs-auth"
+      tls:
+        caBundleSecret: "hub-ca-bundle"      # optional
+      attributes:                            # optional; auto-detected otherwise
+        cluster_name: "spoke-1"
+        cluster_id: "374d8722-81a3-4a60-ae7d-6e92c025aab8"
+```
+
+`usageLogging` remains the feature gate. When it is `false` or omitted the usage-logs collector
+is not deployed at all, so `remoteOtlp` has no effect.
+
+**Dual-write, not redirect.** The existing export to the spoke-local LokiStack is untouched. The
+remote copy travels on its own `logs/remote` pipeline, which is why cluster identity never
+appears in the local write.
+
+**Endpoint.** Give the OTLP base URL including the tenant path and *excluding* `/v1/logs` — the
+exporter appends that itself. Note the tenant in the path is the receiver's, and need not match
+the `application` tenant used locally.
+
+!!! note "Querying the receiver"
+    The receiver's tenant and the record's `log_type` are independent. Usage records always
+    carry `log_type="application"`, set by the collector, even when written to an
+    `infrastructure` tenant. So a record sent to
+    `/api/logs/v1/infrastructure/otlp` is read back with
+    `GET /api/logs/v1/infrastructure/…?query={log_type="application"}`. Selecting
+    `{log_type="infrastructure"}` matches nothing and looks like delivery failure.
+
+**`headersSecret`** must exist in the monitoring namespace. **Every key becomes an HTTP header**,
+so a bearer token is supplied as a key named `Authorization` whose value is `Bearer <token>`.
+Values are projected into the collector as environment variables and referenced indirectly, so
+no credential is ever written into the `OpenTelemetryCollector` object.
+
+**`tls.caBundleSecret`** is only needed when the receiver's certificate is not publicly trusted.
+The Secret must live in the monitoring namespace and carry a `ca-bundle.crt` key; it is mounted
+read-only and wired to the exporter's `ca_file`.
+
+**Cluster attribution.** Remote records carry `cluster_id` and `cluster_name` resource
+attributes. Both are auto-detected — `cluster_id` from the `id.k8s.io` ClusterClaim and
+`cluster_name` from the Klusterlet, falling back to the `kubernetes.io/cluster-name`
+ClusterClaim. On a cluster not managed by ACM neither exists, and the values fall back to
+`unknown-cluster-id` / `unknown-cluster-name`; set `attributes` explicitly there.
+
+**Status.** `Config.status.conditions` carries `RemoteUsageLogsConfigured`. A missing or empty
+`headersSecret` sets it `False` and leaves local usage logging running rather than taking the
+whole pipeline down. Removing `remoteOtlp` removes the exporter, the pipeline and the condition.
+
+!!! warning "Delivery is best-effort"
+    The remote exporter uses the collector's standard **in-memory** retry queue. It rides out a
+    brief outage of the receiver, but a collector restart or OOM kill discards whatever is
+    buffered, and those usage records are gone. Persistent file-backed queue storage is not
+    configured. Do not treat the remote copy as an authoritative billing record without
+    accounting for this.
+
 !!! warning "Privacy"
     Structured access logs record request attributes.
     User identity (`user_id`) is included only when `MaasTenantConfig.spec.telemetry.logs.captureUser` is `true`.

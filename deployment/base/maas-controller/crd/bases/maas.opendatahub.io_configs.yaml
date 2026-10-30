@@ -479,6 +479,69 @@ spec:
                   User identity (user_id) is included in those logs only when
                   MaasTenantConfig.spec.telemetry.logs.captureUser is true.
                 type: boolean
+              usageLogs:
+                description: |-
+                  UsageLogs contains advanced usage-log routing settings. It is additive to
+                  UsageLogging, which remains the feature gate: when UsageLogging is false or
+                  unset nothing here is rendered.
+                properties:
+                  remoteOtlp:
+                    description: |-
+                      RemoteOtlp forwards a copy of every usage record to an upstream OTLP/HTTP
+                      receiver, in addition to the spoke-local LokiStack. The local export is
+                      unaffected. Unset means no remote export.
+                    properties:
+                      attributes:
+                        description: |-
+                          Attributes overrides the cluster identity stamped onto remote records.
+                          Anything left empty is auto-detected.
+                        properties:
+                          cluster_id:
+                            description: ClusterID overrides the auto-detected cluster_id.
+                            maxLength: 253
+                            type: string
+                          cluster_name:
+                            description: ClusterName overrides the auto-detected cluster_name.
+                            maxLength: 253
+                            type: string
+                        type: object
+                      endpoint:
+                        description: |-
+                          Endpoint is the OTLP/HTTP base URL of the receiver, including the tenant
+                          path but excluding the /v1/logs suffix, which the exporter appends itself.
+                          Example: https://usage-logs-hub.example.com/api/logs/v1/infrastructure/otlp
+                        maxLength: 2048
+                        minLength: 1
+                        pattern: ^https?://
+                        type: string
+                      headersSecret:
+                        description: |-
+                          HeadersSecret names a Secret in the monitoring namespace whose every
+                          key/value pair is sent as an HTTP header on the remote export, so a bearer
+                          token is supplied as a key named Authorization with value "Bearer <token>".
+                          Values are projected as environment variables and referenced from the
+                          collector config; they are never written into the collector spec.
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      tls:
+                        description: |-
+                          TLS configures trust for the remote endpoint. Omit it when the endpoint
+                          presents a publicly trusted certificate.
+                        properties:
+                          caBundleSecret:
+                            description: |-
+                              CABundleSecret names a Secret in the monitoring namespace holding a
+                              ca-bundle.crt key, mounted into the collector and used to verify the
+                              remote endpoint.
+                            maxLength: 253
+                            type: string
+                        type: object
+                    required:
+                    - endpoint
+                    - headersSecret
+                    type: object
+                type: object
               usageMetricsDashboard:
                 default: false
                 description: |-

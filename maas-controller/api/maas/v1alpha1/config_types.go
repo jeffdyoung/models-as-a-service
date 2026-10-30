@@ -31,6 +31,11 @@ const (
 	// to report the aggregate health of all AITenant CRs across the cluster.
 	// It follows the ADR ODH-ADR-MS-0003 three-state model (Healthy/Degraded/Blocked).
 	ConfigConditionTenantsHealthy = "TenantsHealthy"
+
+	// ConfigConditionRemoteUsageLogsConfigured reports whether the remote OTLP
+	// exporter described by spec.usageLogs.remoteOtlp could be rendered. It is
+	// absent when remoteOtlp is unset.
+	ConfigConditionRemoteUsageLogsConfigured = "RemoteUsageLogsConfigured"
 )
 
 // MaaSAPIEgressNetworkPolicyMode controls maas-controller reconciliation of
@@ -129,6 +134,78 @@ type ConfigSpec struct {
 	// +kubebuilder:default=false
 	// +kubebuilder:validation:Optional
 	UsageMetricsDashboard *bool `json:"usageMetricsDashboard,omitempty"`
+
+	// UsageLogs contains advanced usage-log routing settings. It is additive to
+	// UsageLogging, which remains the feature gate: when UsageLogging is false or
+	// unset nothing here is rendered.
+	// +optional
+	UsageLogs *UsageLogsConfig `json:"usageLogs,omitempty"`
+}
+
+// UsageLogsConfig holds advanced usage-log settings.
+type UsageLogsConfig struct {
+	// RemoteOtlp forwards a copy of every usage record to an upstream OTLP/HTTP
+	// receiver, in addition to the spoke-local LokiStack. The local export is
+	// unaffected. Unset means no remote export.
+	// +optional
+	RemoteOtlp *RemoteOtlpConfig `json:"remoteOtlp,omitempty"`
+}
+
+// RemoteOtlpConfig configures the remote OTLP/HTTP exporter.
+type RemoteOtlpConfig struct {
+	// Endpoint is the OTLP/HTTP base URL of the receiver, including the tenant
+	// path but excluding the /v1/logs suffix, which the exporter appends itself.
+	// Example: https://usage-logs-hub.example.com/api/logs/v1/infrastructure/otlp
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=2048
+	// +kubebuilder:validation:Pattern=`^https?://`
+	Endpoint string `json:"endpoint"`
+
+	// HeadersSecret names a Secret in the monitoring namespace whose every
+	// key/value pair is sent as an HTTP header on the remote export, so a bearer
+	// token is supplied as a key named Authorization with value "Bearer <token>".
+	// Values are projected as environment variables and referenced from the
+	// collector config; they are never written into the collector spec.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	HeadersSecret string `json:"headersSecret"`
+
+	// TLS configures trust for the remote endpoint. Omit it when the endpoint
+	// presents a publicly trusted certificate.
+	// +optional
+	TLS *RemoteOtlpTLSConfig `json:"tls,omitempty"`
+
+	// Attributes overrides the cluster identity stamped onto remote records.
+	// Anything left empty is auto-detected.
+	// +optional
+	Attributes *RemoteOtlpAttributesConfig `json:"attributes,omitempty"`
+}
+
+// RemoteOtlpTLSConfig defines TLS parameters for the remote exporter.
+type RemoteOtlpTLSConfig struct {
+	// CABundleSecret names a Secret in the monitoring namespace holding a
+	// ca-bundle.crt key, mounted into the collector and used to verify the
+	// remote endpoint.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	CABundleSecret string `json:"caBundleSecret,omitempty"`
+}
+
+// RemoteOtlpAttributesConfig overrides the resource attributes identifying this
+// cluster on remote records. These are applied only to the remote pipeline, so
+// they never reach the spoke-local LokiStack.
+type RemoteOtlpAttributesConfig struct {
+	// ClusterName overrides the auto-detected cluster_name.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	ClusterName string `json:"cluster_name,omitempty"`
+
+	// ClusterID overrides the auto-detected cluster_id.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	ClusterID string `json:"cluster_id,omitempty"`
 }
 
 // ConfigStatus defines the observed state of Config.
